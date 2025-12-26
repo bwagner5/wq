@@ -10,15 +10,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestWQ(t *testing.T) {
-
-	echoProcessor := func(ctx context.Context, input int) (int, error) {
+var (
+	echoProcessor = func(ctx context.Context, input int) (int, error) {
 		return input, nil
 	}
 
-	errProcessor := func(ctx context.Context, input int) (int, error) {
+	errProcessor = func(ctx context.Context, input int) (int, error) {
 		return input, fmt.Errorf("error")
 	}
+)
+
+func TestWQ(t *testing.T) {
 
 	t.Run("Simple Work Queue", func(t *testing.T) {
 		ctx := context.Background()
@@ -59,4 +61,25 @@ func TestWQ(t *testing.T) {
 			require.Equal(t, fmt.Errorf("error"), result.Error)
 		}
 	})
+}
+
+func Benchmark(b *testing.B) {
+	queue := wq.New(5, 1, 100, 100, echoProcessor)
+	queue.Start(b.Context())
+	b.ResetTimer()
+	go func() {
+		for range queue.Results() {
+		}
+	}()
+
+	b.RunParallel(func(p *testing.PB) {
+		for p.Next() {
+			queue.MustAdd(1)
+			// require.NoError(b, queue.AddWithBackOff(1, 5*time.Second, 3), fmt.Sprintf("%+v\n", queue.Status()))
+		}
+	})
+
+	unprocessed := queue.Stop()
+	fmt.Printf("Unprocessed Items: %d\n", unprocessed)
+	fmt.Printf("%+v\n", queue.Status())
 }

@@ -23,6 +23,15 @@ var (
 	UnableToStartErr    = fmt.Errorf("work queue cannot be started")
 )
 
+var (
+	DefaultResultsPolicy = ResultsPolicyQueue
+	DefaultRetryPolicy   = RetryPolicy{
+		MaxRetries:        2,
+		Strategy:          RetryStrategyExponentialBackoff,
+		InitialRetryDelay: 1 * time.Second,
+	}
+)
+
 // Queue is a generic and parallel work queue that buffers inputs and outputs of a provided Processor function.
 // Use wq.New() to instantiate the Queue.
 type Queue[T, R any] struct {
@@ -30,21 +39,10 @@ type Queue[T, R any] struct {
 	stateCode uint8
 	// currentState is the full State of the queue with all summary metrics
 	currentState *Status
-	// processor is a user-defined processing func
-	processor ProcessorFunc[T, R]
-	// concurrency is the number of processor loops running that consume from the input channel/queue
-	concurrency int
-	// allowedRetries is how many times a work item input can be requeued for a retry.
-	// The Processor func must return an error for the work item to be considered for retry
-	allowedRetries int
-	// inputSize is the buffer size for the input channel/queue
-	inputSize int
 	// input is the channel/queue that stores pending work items for processing
 	inputQueue chan *WorkItem[T]
-	// outputSize is the buffer size for the ouput channel/queue
-	outputSize int
-	// output is the channel that stores processing results
-	outputQueue chan *Result[T, R]
+	// resultsQueueSize is the channel that stores processing results
+	resultsQueue chan *Result[T, R]
 	// wqCtx is the work queue's context used for shutting down the queue.
 	wqCtx context.Context
 	// cancel is a context cancel func used for shutting down the work queue and processors
@@ -55,9 +53,13 @@ type Queue[T, R any] struct {
 	// and is used for draining work items
 	workItemWaitGroup sync.WaitGroup
 	// mu is a lock for initialization and State changes
-	mu              sync.RWMutex
-	inProgressItems atomic.Int64
+	mu sync.RWMutex
 
+	options Options[T, R]
+
+	// status metrics:
+
+	inProgressItems            atomic.Int64
 	totalRetriesProcessed      atomic.Int64
 	totalProcessingErrors      atomic.Int64
 	totalSuccessfullyProcessed atomic.Int64
@@ -66,6 +68,46 @@ type Queue[T, R any] struct {
 	durationNanoSum            int
 	maxLatency                 time.Duration
 	minLatency                 time.Duration
+}
+
+type Options[T, R any] struct {
+	// Concurrency is the number of processor loops running that consume from the input channel/queue
+	Concurrency int
+	// InputQueueSize is the buffer size for the input channel/queue
+	InputQueueSize int
+	// ResultsQueueSize is the buffer size for the ouput channel/queue
+	ResultsQueueSize int
+	// ResultsPolicy determines how to handle results from the processor func
+	ResultsPolicy *ResultsPolicy
+
+	RetryPolicy *RetryPolicy
+	// ProcessorFunc is a user-defined processing func
+	ProcessorFunc ProcessorFunc[T, R]
+}
+
+type ResultsPolicy string
+
+var (
+	ResultsPolicyQueue = ResultsPolicy("QUEUE")
+	ResultsPolicyDrop  = ResultsPolicy("DROP")
+)
+
+type RetryStrategy string
+
+var (
+	RetryStrategyExponentialBackoff = RetryStrategy("EXPONENTIAL BACKOFF")
+	RetryStrategyImmediateRequeue   = RetryStrategy("IMMEDIATE REQUEUE")
+)
+
+type RetryPolicy struct {
+	// MaxRetries is how many times a work item input can be requeued for a retry.
+	// The Processor func must return an error for the work item to be considered for retry
+	MaxRetries int
+	// Strategy determines how retries are requeued for reprocessing
+	Strategy RetryStrategy
+	// InitialRetryDelay is the time to wait before retrying on the first attempt.
+	// The Strategy will affect they delay after the first retry, but still based on the initial delay.
+	InitialRetryDelay time.Duration
 }
 
 type Result[T, R any] struct {
@@ -82,14 +124,38 @@ type WorkItem[T any] struct {
 
 // Metadata shows processing information
 type Metadata struct {
-	StartTime time.Time
-	EndTime   time.Time
-	Latency   time.Duration
-	Attempt   int
-	Retries   int
+	startTime time.Time
+	endTime   time.Time
+	latency   time.Duration
+	attempt   int
+	retries   int
 	// Errors shows all attempt errors
-	Errors []error
+	errors []error
 	// worker ID?
+}
+
+func (m Metadata) StartTime() time.Time {
+	return m.startTime
+}
+
+func (m Metadata) EndTime() time.Time {
+	return m.endTime
+}
+
+func (m Metadata) Latency() time.Duration {
+	return m.latency
+}
+
+func (m Metadata) Attempt() int {
+	return m.attempt
+}
+
+func (m Metadata) Retries() int {
+	return m.retries
+}
+
+func (m Metadata) Errors() []error {
+	return m.errors
 }
 
 type Status struct {
@@ -113,20 +179,41 @@ type Status struct {
 // ProcessorFunc is a generic, user-provided processing func for the input items added to the queue
 type ProcessorFunc[T, R any] func(context.Context, T) (R, error)
 
-// New creates a concurrent work queue
-func New[T, R any](concurrency, allowedRetries, inputSize, outputSize int, processor ProcessorFunc[T, R]) *Queue[T, R] {
+// New creates a concurrent work queue with sane defaults
+func New[T, R any](concurrency, maxRetries, queueSize int, processor ProcessorFunc[T, R]) *Queue[T, R] {
+	options := Options[T, R]{
+		Concurrency:   concurrency,
+		ProcessorFunc: processor,
+		RetryPolicy: &RetryPolicy{
+			MaxRetries: maxRetries,
+			Strategy:   RetryStrategyExponentialBackoff,
+		},
+		ResultsPolicy:    &ResultsPolicyQueue,
+		InputQueueSize:   queueSize,
+		ResultsQueueSize: queueSize,
+	}
+	return NewFromOptions(options)
+}
+
+// NewFromOptions creates a concurrent work queue with a custom configuration
+func NewFromOptions[T, R any](options Options[T, R]) *Queue[T, R] {
 	return &Queue[T, R]{
-		stateCode:      StateInitialized,
-		processor:      processor,
-		concurrency:    concurrency,
-		allowedRetries: allowedRetries,
-		inputSize:      inputSize,
-		outputSize:     outputSize,
+		stateCode: StateInitialized,
+		options:   setDefaultOptions(options),
 	}
 }
 
-// Start executes processors based on the concurrency configured from New()
-// Alternatively, you can just call Add() to auto-start the work queue
+func setDefaultOptions[T, R any](options Options[T, R]) Options[T, R] {
+	if options.ResultsPolicy == nil {
+		options.ResultsPolicy = &DefaultResultsPolicy
+	}
+	if options.RetryPolicy == nil {
+		options.RetryPolicy = &DefaultRetryPolicy
+	}
+	return options
+}
+
+// Start executes processors based on the queue options
 func (wq *Queue[T, R]) Start(ctx context.Context) error {
 	wq.mu.Lock()
 	defer wq.mu.Unlock()
@@ -144,12 +231,14 @@ func (wq *Queue[T, R]) Start(ctx context.Context) error {
 	wq.cancel = cancel
 	wq.wqCtx = wqCtx
 
-	if wq.outputSize > 0 {
-		wq.outputQueue = make(chan *Result[T, R], wq.outputSize)
+	if wq.options.ResultsQueueSize > 0 {
+		wq.resultsQueue = make(chan *Result[T, R], wq.options.ResultsQueueSize)
+	} else {
+		wq.resultsQueue = make(chan *Result[T, R])
 	}
-	wq.inputQueue = make(chan *WorkItem[T], wq.inputSize)
+	wq.inputQueue = make(chan *WorkItem[T], wq.options.InputQueueSize)
 
-	for i := 0; i < wq.concurrency; i++ {
+	for i := 0; i < wq.options.Concurrency; i++ {
 		wq.processorWaitGroup.Add(1)
 		go func(wqCtx context.Context) {
 			defer wq.processorWaitGroup.Done()
@@ -180,28 +269,29 @@ func (wq *Queue[T, R]) executer(ctx context.Context, workItem *WorkItem[T]) {
 	defer wq.inProgressItems.Add(-1)
 	defer wq.workItemWaitGroup.Done()
 
-	workItem.Metadata.Attempt++
-	workItem.Metadata.StartTime = time.Now().UTC()
-	output, err := wq.processor(ctx, workItem.Input)
-	workItem.Metadata.EndTime = time.Now().UTC()
-	workItem.Metadata.Latency = workItem.Metadata.EndTime.Sub(workItem.Metadata.StartTime)
+	workItem.Metadata.attempt++
+	workItem.Metadata.startTime = time.Now().UTC()
+	output, err := wq.options.ProcessorFunc(ctx, workItem.Input)
+	workItem.Metadata.retries = workItem.Metadata.attempt - 1
+	workItem.Metadata.endTime = time.Now().UTC()
+	workItem.Metadata.latency = workItem.Metadata.endTime.Sub(workItem.Metadata.startTime)
 
 	// lock to update latency stats
 	wq.mu.Lock()
-	if workItem.Metadata.Latency > wq.maxLatency {
-		wq.maxLatency = workItem.Metadata.Latency
+	if workItem.Metadata.latency > wq.maxLatency {
+		wq.maxLatency = workItem.Metadata.latency
 	}
 
-	if workItem.Metadata.Latency < wq.minLatency || workItem.Metadata.Latency == 0 {
-		wq.minLatency = workItem.Metadata.Latency
+	if workItem.Metadata.latency < wq.minLatency || wq.minLatency == 0 {
+		wq.minLatency = workItem.Metadata.latency
 	}
 	// we need to do this while locked so that when we compute avg latency, duration sum and total items are in-sync
 	// since we're locking anyways, we're using regular ints rather than atomics.
-	wq.durationNanoSum += int(workItem.Metadata.Latency)
+	wq.durationNanoSum += int(workItem.Metadata.latency)
 	wq.totalItemsProcessed++
 	wq.mu.Unlock()
 
-	if workItem.Metadata.Attempt > 1 {
+	if workItem.Metadata.attempt > 1 {
 		wq.totalRetriesProcessed.Add(1)
 	}
 
@@ -210,37 +300,66 @@ func (wq *Queue[T, R]) executer(ctx context.Context, workItem *WorkItem[T]) {
 	// OR
 	// If all retries have been exhausted, we just return the error in the Result back to the user
 	if err != nil {
-		workItem.Metadata.Errors = append(workItem.Metadata.Errors, err)
-		if workItem.Metadata.Retries < wq.allowedRetries {
-			wq.retry(workItem)
+		workItem.Metadata.errors = append(workItem.Metadata.errors, err)
+		if workItem.Metadata.retries < wq.options.RetryPolicy.MaxRetries {
+			switch wq.options.RetryPolicy.Strategy {
+			case RetryStrategyImmediateRequeue:
+				wq.retry(workItem, 0)
+			case RetryStrategyExponentialBackoff:
+				wq.retry(workItem, wq.options.RetryPolicy.InitialRetryDelay<<time.Duration(workItem.Metadata.retries+1))
+			}
+
 			return
 		} else {
 			wq.totalProcessingErrors.Add(1)
-			select {
-			case <-ctx.Done():
-			case wq.outputQueue <- &Result[T, R]{
-				Input:    workItem.Input,
-				Output:   output,
-				Metadata: workItem.Metadata,
-				Error:    err,
-			}:
-			}
-
+			wq.sendResult(ctx, workItem.Input, output, workItem.Metadata, err)
 			return
 		}
 	}
 	wq.totalSuccessfullyProcessed.Add(1)
-	// If we get a success, return the Result with nil error
-	select {
-	case <-ctx.Done():
-	case wq.outputQueue <- &Result[T, R]{
-		Input:    workItem.Input,
-		Output:   output,
-		Metadata: workItem.Metadata,
-		Error:    nil,
-	}:
-	}
+	wq.sendResult(ctx, workItem.Input, output, workItem.Metadata, nil)
+}
 
+func (wq *Queue[T, R]) sendResult(ctx context.Context, input T, output R, metadata *Metadata, err error) {
+	if wq.options.ResultsQueueSize <= 0 {
+		return
+	}
+	result := &Result[T, R]{
+		Input:    input,
+		Output:   output,
+		Metadata: metadata,
+		Error:    err,
+	}
+	switch string(*wq.options.ResultsPolicy) {
+	case string(ResultsPolicyQueue):
+		select {
+		case <-ctx.Done():
+		case wq.resultsQueue <- result:
+		}
+	case string(ResultsPolicyDrop):
+		select {
+		case wq.resultsQueue <- result:
+		default:
+		}
+	default:
+		panic("invalid ResultsPolicy")
+	}
+}
+
+func (wq *Queue[T, R]) add(workItem *WorkItem[T]) error {
+	select {
+	case <-wq.wqCtx.Done():
+		return NotAcceptingWorkErr
+	default:
+		wq.workItemWaitGroup.Add(1)
+		select {
+		case wq.inputQueue <- workItem:
+		default:
+			wq.workItemWaitGroup.Done()
+			return WorkQueueFullErr
+		}
+	}
+	return nil
 }
 
 // Add enqueues an item to the work queue for processing
@@ -251,22 +370,10 @@ func (wq *Queue[T, R]) Add(item T) error {
 		return NotAcceptingWorkErr
 	}
 
-	select {
-	case <-wq.wqCtx.Done():
-		return NotAcceptingWorkErr
-	default:
-		wq.workItemWaitGroup.Add(1)
-		select {
-		case wq.inputQueue <- &WorkItem[T]{
-			Input:    item,
-			Metadata: &Metadata{},
-		}:
-		default:
-			wq.workItemWaitGroup.Done()
-			return WorkQueueFullErr
-		}
-	}
-	return nil
+	return wq.add(&WorkItem[T]{
+		Input:    item,
+		Metadata: &Metadata{},
+	})
 }
 
 // AddWithBackoff enqueues an item to the work queue for processing, but if the queue is full, wait and try again.
@@ -302,15 +409,29 @@ func (wq *Queue[T, R]) MustAdd(item T) {
 	}
 }
 
-func (wq *Queue[T, R]) retry(workItem *WorkItem[T]) {
-	wq.mu.RLock()
-	defer wq.mu.RUnlock()
-	if wq.stateCode != StateDraining && wq.stateCode != StateActive {
-		return
-	}
+func (wq *Queue[T, R]) retry(workItem *WorkItem[T], delay time.Duration) {
 	wq.workItemWaitGroup.Add(1)
-	workItem.Metadata.Retries++
-	wq.inputQueue <- workItem
+	go func() {
+		timer := time.NewTimer(delay)
+		defer wq.workItemWaitGroup.Done()
+		defer timer.Stop()
+		select {
+		case <-wq.wqCtx.Done():
+			return
+		case <-timer.C:
+			wq.mu.RLock()
+			defer wq.mu.RUnlock()
+			if wq.stateCode != StateDraining && wq.stateCode != StateActive {
+				return
+			}
+			if err := wq.add(workItem); err != nil {
+				// if the input queue is full, try again after waiting the avg latency of processing
+				if err == WorkQueueFullErr {
+					wq.retry(workItem, wq.currentState.AvgLatency)
+				}
+			}
+		}
+	}()
 }
 
 // Result returns a queued result from processed work items.
@@ -318,7 +439,10 @@ func (wq *Queue[T, R]) retry(workItem *WorkItem[T]) {
 // until new items are added and processed OR the work queue is Stopped.
 // The second argument follows the "comma ok" pattern and signifies the results queue has been full drained and stopped.
 func (wq *Queue[T, R]) Result() (*Result[T, R], bool) {
-	output, ok := <-wq.outputQueue
+	if wq.options.ResultsQueueSize <= 0 {
+		return nil, false
+	}
+	output, ok := <-wq.resultsQueue
 	if !ok {
 		return nil, false
 	}
@@ -339,7 +463,8 @@ func (wq *Queue[T, R]) Results() func(func(*Result[T, R]) bool) {
 }
 
 // Drain closes the work queue for new work, but the remaining work is processed, including any necessary retries.
-// A successful Drain will transition from Active -> Draining -> Stopping -> Stopped
+// A successful Drain will transition from Active -> Draining -> Stopping -> Stopped.
+// Drain is blocking until the work queue is empty or the timeout elapses.
 func (wq *Queue[T, R]) Drain(timeout time.Duration) error {
 	wq.setStateCode(StateDraining)
 
@@ -361,7 +486,7 @@ func (wq *Queue[T, R]) Drain(timeout time.Duration) error {
 		return DrainTimeoutErr
 	}
 
-	close(wq.outputQueue)
+	close(wq.resultsQueue)
 	wq.setStateCode(StateStopped)
 	return nil
 }
@@ -377,7 +502,7 @@ func (wq *Queue[T, R]) Stop() int {
 	close(wq.inputQueue)
 	wq.cancel()
 	wq.processorWaitGroup.Wait()
-	close(wq.outputQueue)
+	close(wq.resultsQueue)
 	unprocessed := 0
 	for range wq.inputQueue {
 		unprocessed++
@@ -416,10 +541,10 @@ func (wq *Queue[T, R]) Status() Status {
 	return Status{
 		State:                      wq.stateCodeDescription(wq.stateCode),
 		StateCode:                  int(wq.stateCode),
-		QueuedResults:              len(wq.outputQueue),
-		ResultsQueueSize:           wq.outputSize,
+		QueuedResults:              len(wq.resultsQueue),
+		ResultsQueueSize:           wq.options.ResultsQueueSize,
 		QueuedWorkItems:            len(wq.inputQueue),
-		WorkItemQueueSize:          wq.inputSize,
+		WorkItemQueueSize:          wq.options.InputQueueSize,
 		InProgressWorkItems:        int(wq.inProgressItems.Load()),
 		TotalWorkItemsProcessed:    int(wq.totalItemsProcessed),
 		TotalProcessingErrors:      int(wq.totalProcessingErrors.Load()),

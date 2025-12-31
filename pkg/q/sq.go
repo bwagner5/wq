@@ -8,11 +8,11 @@ import (
 )
 
 const (
-	StateInitialized = 0
-	StateActive      = 1
-	StateDraining    = 2
-	StateStopping    = 3
-	StateStopped     = 4
+	StateInitialized = uint8(0)
+	StateActive      = uint8(1)
+	StateDraining    = uint8(2)
+	StateStopping    = uint8(3)
+	StateStopped     = uint8(4)
 )
 
 var (
@@ -36,6 +36,8 @@ var (
 type SimpleQueue[T, R any] struct {
 	// stateCode indicates the work queue's current mode
 	stateCode uint8
+	// stateEvents provides a mechanism for a consumer to listen for state changes in the queue.
+	stateEvents chan uint8
 	// input is the channel/queue that stores pending work items for processing
 	inputQueue chan T
 	// resultsQueueSize is the channel that stores processing results
@@ -68,8 +70,6 @@ type SimpleOptions[T, R any] struct {
 	ErrorsQueueSize int
 	// ResultsPolicy determines how to handle results from the processor func. This includes errors
 	ResultsPolicy *ResultsPolicy
-	// RetryPolicy configures how to handle failures, retries, and backoff
-	RetryPolicy *RetryPolicy
 	// ProcessorFunc is a user-defined processing func
 	ProcessorFunc ProcessorFunc[T, R]
 }
@@ -108,9 +108,6 @@ func NewFromSimpleOptions[T, R any](options SimpleOptions[T, R]) *SimpleQueue[T,
 func setDefaultSimpleOptions[T, R any](options SimpleOptions[T, R]) SimpleOptions[T, R] {
 	if options.ResultsPolicy == nil {
 		options.ResultsPolicy = &DefaultResultsPolicy
-	}
-	if options.RetryPolicy == nil {
-		options.RetryPolicy = &DefaultRetryPolicy
 	}
 	return options
 }
@@ -182,6 +179,7 @@ func (wq *SimpleQueue[T, R]) sendResult(ctx context.Context, output R, err error
 		return
 	}
 
+	// send errors
 	if err != nil {
 		switch string(*wq.options.ResultsPolicy) {
 		case string(ResultsPolicyQueue):
@@ -200,6 +198,7 @@ func (wq *SimpleQueue[T, R]) sendResult(ctx context.Context, output R, err error
 		return
 	}
 
+	// send results
 	switch string(*wq.options.ResultsPolicy) {
 	case string(ResultsPolicyQueue):
 		select {

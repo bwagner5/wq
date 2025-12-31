@@ -1,8 +1,6 @@
 package q_test
 
 import (
-	"context"
-	"fmt"
 	"testing"
 	"time"
 
@@ -13,9 +11,8 @@ import (
 func TestWQ(t *testing.T) {
 
 	t.Run("Simple Work Queue", func(t *testing.T) {
-		ctx := context.Background()
-		queue := q.New(1, 0, 5, echoProcessor)
-		queue.Start(ctx)
+		queue := q.New(2, 0, 5, echoProcessor)
+		queue.Start(t.Context())
 
 		for i := 1; i <= 5; i++ {
 			queue.MustAdd(i)
@@ -24,31 +21,48 @@ func TestWQ(t *testing.T) {
 		err := queue.Drain(time.Second * 5)
 		require.NoError(t, err)
 
-		for i := 1; i <= 5; i++ {
-			result, ok := queue.Result()
-			require.Equal(t, true, ok)
-			require.Equal(t, i, result.Output)
+		require.Equal(t, q.StateStopped, queue.Status().StateCode)
+		require.Equal(t, 5, queue.Status().QueuedResults)
+		require.Equal(t, 5, queue.Status().TotalWorkItemsProcessed)
+		require.Equal(t, 5, queue.Status().TotalSuccessfullyProcessed)
+		require.Equal(t, 0, queue.Status().TotalProcessingErrors)
+		require.Equal(t, 0, queue.Status().QueuedWorkItems)
+		require.Equal(t, 0, queue.Status().TotalConsumedResults)
+		require.Equal(t, 0, queue.Status().TotalRetries)
+		require.Equal(t, 0, queue.Status().InProgressWorkItems)
+
+		for result := range queue.Results() {
+			require.Equal(t, result.Input, result.Output)
 		}
+
+		require.Equal(t, 5, queue.Status().TotalConsumedResults)
+		require.Equal(t, 0, queue.Status().QueuedResults)
+
 	})
 
 	t.Run("Retries", func(t *testing.T) {
-		ctx := context.Background()
-		queue := q.New(1, 1, 5, errProcessor)
-		queue.Start(ctx)
+		queue := q.New(2, 1, 5, errProcessor)
+		queue.Start(t.Context())
 
 		for i := 1; i <= 5; i++ {
 			queue.MustAdd(i)
 		}
 
-		err := queue.Drain(time.Second * 5_000)
+		err := queue.Drain(time.Second * 5)
 		require.NoError(t, err)
 
-		for i := 1; i <= 5; i++ {
-			err, ok := queue.Error()
-			require.Equal(t, true, ok)
-			require.Equal(t, 2, q.ResultErr[int, int](err).result.Metadata.Attempt())
-			require.Equal(t, 1, result.Metadata.Retries())
-			require.Equal(t, fmt.Errorf("error"), result.Err)
+		require.Equal(t, q.StateStopped, queue.Status().StateCode)
+		require.Equal(t, 0, queue.Status().QueuedResults)
+		require.Equal(t, 10, queue.Status().TotalWorkItemsProcessed)
+		require.Equal(t, 0, queue.Status().TotalSuccessfullyProcessed)
+		require.Equal(t, 5, queue.Status().TotalProcessingErrors)
+		require.Equal(t, 0, queue.Status().QueuedWorkItems)
+		require.Equal(t, 0, queue.Status().TotalConsumedResults)
+		require.Equal(t, 5, queue.Status().TotalRetries)
+		require.Equal(t, 0, queue.Status().InProgressWorkItems)
+
+		for err := range queue.Errors() {
+			require.Equal(t, "error", err.(*q.ResultErr[int, int]).Error())
 		}
 	})
 }

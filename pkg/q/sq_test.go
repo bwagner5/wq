@@ -3,6 +3,7 @@ package q_test
 import (
 	"context"
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -22,10 +23,46 @@ var (
 
 func TestSQ(t *testing.T) {
 
-	t.Run("Simple Work Queue", func(t *testing.T) {
-		ctx := context.Background()
+	t.Run("Idempotent Start", func(t *testing.T) {
 		queue := q.NewSimpleQueue(2, 0, 5, echoProcessor)
-		queue.Start(ctx)
+		require.Equal(t, q.StateInitialized, queue.StateCode())
+		require.NoError(t, queue.Start(t.Context()))
+		require.Equal(t, q.StateActive, queue.StateCode())
+		require.NoError(t, queue.Start(t.Context()))
+		require.Equal(t, q.StateActive, queue.StateCode())
+		require.NoError(t, queue.Start(t.Context()))
+		require.Equal(t, q.StateActive, queue.StateCode())
+		require.Equal(t, 0, queue.Stop())
+		require.Equal(t, q.StateStopped, queue.StateCode())
+	})
+
+	t.Run("Adds Not Allowed When Draining", func(t *testing.T) {
+		stop := make(chan struct{})
+		timeoutProcessor := func(ctx context.Context, input int) (int, error) {
+			select {
+			case <-ctx.Done():
+				require.Fail(t, "processor stopped on context.Done() rather that the expected stop channel")
+			case <-stop:
+			}
+			return 0, nil
+		}
+		queue := q.NewSimpleQueue(2, 0, 5, timeoutProcessor)
+		queue.Start(t.Context())
+		queue.MustAdd(1)
+		go func() {
+			queue.Drain(time.Second)
+		}()
+		// wait for the queue to start draining
+		for queue.StateCode() != q.StateDraining {
+			time.Sleep(10 * time.Microsecond)
+		}
+		require.EqualError(t, q.NotAcceptingWorkErr, queue.Add(2).Error())
+		close(stop)
+	})
+
+	t.Run("Simple Work Queue", func(t *testing.T) {
+		queue := q.NewSimpleQueue(2, 0, 5, echoProcessor)
+		queue.Start(t.Context())
 
 		for i := 1; i <= 5; i++ {
 			queue.MustAdd(i)
@@ -33,23 +70,26 @@ func TestSQ(t *testing.T) {
 
 		err := queue.Drain(time.Second * 5)
 		require.NoError(t, err)
+		require.Equal(t, q.StateStopped, queue.StateCode())
 
-		for i := 1; i <= 5; i++ {
-			result, ok := queue.Result()
-			require.Equal(t, true, ok)
-			require.Equal(t, i, *result)
+		var results []int
+		for r := range queue.Results() {
+			results = append(results, *r)
+		}
+		slices.Sort(results)
+
+		for i, r := range results {
+			require.Equal(t, i+1, r)
 		}
 
 		for range queue.Errors() {
 			require.Fail(t, "should not have received any errors during processing")
 		}
-
 	})
 
 	t.Run("Errors", func(t *testing.T) {
-		ctx := context.Background()
 		queue := q.NewSimpleQueue(2, 1, 5, errProcessor)
-		queue.Start(ctx)
+		queue.Start(t.Context())
 
 		for i := 1; i <= 5; i++ {
 			queue.MustAdd(i)
@@ -57,6 +97,7 @@ func TestSQ(t *testing.T) {
 
 		err := queue.Drain(time.Second * 5)
 		require.NoError(t, err)
+		require.Equal(t, q.StateStopped, queue.StateCode())
 
 		var errs []error
 		for err := range queue.Errors() {
@@ -64,6 +105,38 @@ func TestSQ(t *testing.T) {
 			require.Equal(t, fmt.Errorf("error"), err)
 		}
 		require.Len(t, errs, 5)
+	})
+
+	t.Run("Draining Timeout", func(t *testing.T) {
+		stop := make(chan struct{})
+		timeoutProcessor := func(ctx context.Context, input int) (int, error) {
+			select {
+			case <-ctx.Done():
+				require.Fail(t, "processor stopped on context.Done() rather that the expected stop channel")
+			case <-stop:
+			}
+			return 0, nil
+		}
+		queue := q.NewSimpleQueue(2, 1, 5, timeoutProcessor)
+		queue.Start(t.Context())
+
+		for i := 1; i <= 5; i++ {
+			queue.MustAdd(i)
+		}
+
+		require.Equal(t, q.StateActive, queue.StateCode())
+
+		err := queue.Drain(time.Microsecond * 100)
+		require.EqualError(t, q.DrainTimeoutErr, err.Error())
+		require.Equal(t, q.StateDraining, queue.StateCode())
+		close(stop)
+		err = queue.Drain(time.Microsecond * 100)
+		require.NoError(t, err)
+		require.Equal(t, q.StateStopped, queue.StateCode())
+
+		for r := range queue.Results() {
+			require.Equal(t, 0, *r)
+		}
 	})
 }
 

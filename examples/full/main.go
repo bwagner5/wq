@@ -6,29 +6,40 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"os"
 	"time"
 
 	"github.com/bwagner5/q/pkg/q"
 )
 
 func main() {
-	ctx := context.Background()
+	if err := run(context.Background()); err != nil {
+		fmt.Printf("Error:  %s", err)
+		os.Exit(1)
+	}
+}
 
+func run(ctx context.Context) error {
 	// configure the queue with basic options
 	queue := q.NewFromOptions(q.Options[int, int]{
 		Concurrency:      2,
 		InputQueueSize:   10,
 		ResultsQueueSize: 10,
+		ErrorsQueueSize:  10,
 		ProcessorFunc: func(ctx context.Context, n int) (int, error) {
+			select {
 			// random sleep between 0-99ms
-			time.Sleep(time.Duration(rand.IntN(100) * int(time.Millisecond)))
+			case <-time.After(time.Duration(rand.IntN(100) * int(time.Millisecond))):
+			case <-ctx.Done():
+				return -1, fmt.Errorf("terminated early for %d", n)
+			}
 			return n, nil
 		},
 	})
 
 	// start the queue processors
 	if err := queue.Start(ctx); err != nil {
-		panic(err)
+		return err
 	}
 
 	// consume the results in a separate go routine
@@ -54,7 +65,7 @@ func main() {
 			unprocessed := queue.Stop()
 			fmt.Printf("Stopped Queue forcefully without processing %d work items\n", unprocessed)
 		} else {
-			panic(err)
+			return err
 		}
 	} else {
 		fmt.Printf("Gracefully drained work queue\n")
@@ -64,4 +75,5 @@ func main() {
 	fmt.Printf("Stats: \n")
 	stats, _ := json.MarshalIndent(queue.Status(), " ", "    ")
 	fmt.Printf("%s\n", stats)
+	return nil
 }

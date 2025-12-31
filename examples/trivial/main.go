@@ -18,20 +18,15 @@ func main() {
 }
 
 func run(ctx context.Context) error {
-	// configure the queue with basic options
-	queue := q.NewFromSimpleOptions(q.SimpleOptions[int, int]{
-		Concurrency:      2,
-		InputQueueSize:   10,
-		ResultsQueueSize: 10,
-		ProcessorFunc: func(ctx context.Context, n int) (int, error) {
-			select {
-			// random sleep between 0-99ms
-			case <-time.After(time.Duration(rand.IntN(100) * int(time.Millisecond))):
-			case <-ctx.Done():
-				return -1, fmt.Errorf("terminated early for %d", n)
-			}
-			return n, nil
-		},
+	// configure the queue
+	queue := q.NewSimpleQueue(2, 0, 10, func(ctx context.Context, n int) (int, error) {
+		select {
+		// random sleep between 0-99ms
+		case <-time.After(time.Duration(rand.IntN(100) * int(time.Millisecond))):
+		case <-ctx.Done():
+			return -1, fmt.Errorf("terminated early for %d", n)
+		}
+		return n, nil
 	})
 
 	// start the queue processors

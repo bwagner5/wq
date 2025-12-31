@@ -41,6 +41,8 @@ type Options[T, R any] struct {
 	InputQueueSize int
 	// ResultsQueueSize is the buffer size for the ouput channel/queue
 	ResultsQueueSize int
+	// ErrorsQueueSize is the buffer size for the errors channel/queue
+	ErrorsQueueSize int
 	// ResultsPolicy determines how to handle results from the processor func
 	ResultsPolicy *ResultsPolicy
 
@@ -125,7 +127,7 @@ func (m Metadata) Errors() []error {
 
 type Status struct {
 	State                      string
-	StateCode                  int
+	StateCode                  uint8
 	QueuedResults              int
 	ResultsQueueSize           int
 	QueuedWorkItems            int
@@ -153,6 +155,7 @@ func New[T, R any](concurrency, maxRetries, queueSize int, processor ProcessorFu
 		ResultsPolicy:    &ResultsPolicyQueue,
 		InputQueueSize:   queueSize,
 		ResultsQueueSize: queueSize,
+		ErrorsQueueSize:  queueSize,
 	}
 	return NewFromOptions(options)
 }
@@ -168,7 +171,7 @@ func NewFromOptions[T, R any](options Options[T, R]) *Queue[T, R] {
 		ResultsPolicy:    (*ResultsPolicy)(options.ResultsPolicy),
 		InputQueueSize:   options.InputQueueSize,
 		ResultsQueueSize: options.ResultsQueueSize,
-		ErrorsQueueSize:  options.ResultsQueueSize,
+		ErrorsQueueSize:  options.ErrorsQueueSize,
 	})
 	return queue
 }
@@ -387,7 +390,7 @@ func (q *Queue[T, R]) Status() Status {
 
 	return Status{
 		State:                      q.squeue.stateCodeDescription(q.squeue.stateCode),
-		StateCode:                  int(q.squeue.stateCode),
+		StateCode:                  q.squeue.stateCode,
 		QueuedResults:              len(q.squeue.resultsQueue),
 		ResultsQueueSize:           q.options.ResultsQueueSize,
 		QueuedWorkItems:            len(q.squeue.inputQueue),

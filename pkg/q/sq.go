@@ -3,6 +3,8 @@ package q
 import (
 	"context"
 	"fmt"
+	"math"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -38,12 +40,18 @@ type SimpleQueue[T, R any] struct {
 	stateCode uint8
 	// stateEvents provides a mechanism for a consumer to listen for state changes in the queue.
 	stateEvents chan uint8
-	// input is the channel/queue that stores pending work items for processing
+	// inputQueue is the channel/queue that stores pending work items for processing
 	inputQueue chan T
+	// inputCloserOnce is used to make the channel closing idempotent between Drain() and Stop()
+	inputCloserOnce sync.Once
 	// resultsQueueSize is the channel that stores processing results
 	resultsQueue chan R
+	// resultsCloserOnce is used to make the channel closing idempotent between Drain() and Stop()
+	resultsCloserOnce sync.Once
 	// errorsQueue is the channel that stores processing errors
 	errorsQueue chan error
+	// errorsCloserOnce is used to make the channel closing idempotent between Drain() and Stop()
+	errorsCloserOnce sync.Once
 	// qCtx is the work queue's context used for shutting down the queue.
 	qCtx context.Context
 	// cancel is a context cancel func used for shutting down the work queue and processors
@@ -110,6 +118,43 @@ func setDefaultSimpleOptions[T, R any](options SimpleOptions[T, R]) SimpleOption
 		options.ResultsPolicy = &defaultResultsPolicy
 	}
 	return options
+}
+
+// Collect can be used for casual concurrent processing use-cases where the data is in a slice and you want a simple and terse
+// call to process the data and get results.
+// There is no need to call Start(), Stop(), or Drain() when using Collect().
+// If the user-provided processor func returns an error, the error is dropped and no result is added to the results slice.
+// If you need to process item errors, use the normal queue setup with individual error and results streams.
+// The concurrency is set using runtime.NumCPU().
+func Collect[T, R any](ctx context.Context, data []T, processor ProcessorFunc[T, R]) ([]R, error) {
+	queue := NewFromSimpleOptions(SimpleOptions[T, R]{
+		Concurrency:      runtime.NumCPU(),
+		ProcessorFunc:    processor,
+		ResultsPolicy:    &ResultsPolicyQueue,
+		InputQueueSize:   len(data),
+		ResultsQueueSize: len(data),
+		ErrorsQueueSize:  len(data),
+	})
+	if err := queue.Start(ctx); err != nil {
+		return nil, err
+	}
+	defer queue.Stop()
+
+	results := make([]R, 0, len(data))
+
+	for _, d := range data {
+		if err := queue.Add(d); err != nil {
+			return nil, err
+		}
+	}
+	if err := queue.Drain(time.Nanosecond * math.MaxInt64); err != nil {
+		return nil, err
+	}
+
+	for r := range queue.Results() {
+		results = append(results, *r)
+	}
+	return results, nil
 }
 
 // Start executes processors based on the queue options
@@ -254,11 +299,12 @@ func (wq *SimpleQueue[T, R]) ForceAdd(item T) error {
 }
 
 // AddWithBackoff enqueues an item to the work queue for processing, but if the queue is full, wait and try again.
-// A total of 3 attempts will be made:
+// A total of maxAttempts will be made:
 //
-//	1: right away like a normal Add()
-//	2: after the initialDelay duration
-//	3: 2x the initialDelay duration
+//		1: right away like a normal Add()
+//		2: after the initialDelay duration
+//		3: 2x the initialDelay duration
+//	    ...
 //
 // If the queue is still full, a WorkSimpleQueueFullErr is returned
 func (wq *SimpleQueue[T, R]) AddWithBackOff(item T, initialDelay time.Duration, maxAttempts int) error {
@@ -356,7 +402,7 @@ func (wq *SimpleQueue[T, R]) Drain(timeout time.Duration) error {
 	}
 
 	wq.setStateCode(StateStopping)
-	close(wq.inputQueue)
+	wq.closeInputQueue()
 
 	select {
 	case <-wq.processorsExited():
@@ -364,8 +410,8 @@ func (wq *SimpleQueue[T, R]) Drain(timeout time.Duration) error {
 		return DrainTimeoutErr
 	}
 
-	close(wq.resultsQueue)
-	close(wq.errorsQueue)
+	wq.closeResultsQueue()
+	wq.closeErrorsQueue()
 	wq.setStateCode(StateStopped)
 	return nil
 }
@@ -378,17 +424,35 @@ func (wq *SimpleQueue[T, R]) Drain(timeout time.Duration) error {
 func (wq *SimpleQueue[T, R]) Stop() int {
 	wq.setStateCode(StateStopping)
 
-	close(wq.inputQueue)
+	wq.closeInputQueue()
 	wq.cancel()
 	wq.processorWaitGroup.Wait()
-	close(wq.resultsQueue)
-	close(wq.errorsQueue)
+	wq.closeResultsQueue()
+	wq.closeErrorsQueue()
 	unprocessed := 0
 	for range wq.inputQueue {
 		unprocessed++
 	}
 	wq.setStateCode(StateStopped)
 	return unprocessed
+}
+
+func (wq *SimpleQueue[T, R]) closeInputQueue() {
+	wq.inputCloserOnce.Do(func() {
+		close(wq.inputQueue)
+	})
+}
+
+func (wq *SimpleQueue[T, R]) closeResultsQueue() {
+	wq.resultsCloserOnce.Do(func() {
+		close(wq.resultsQueue)
+	})
+}
+
+func (wq *SimpleQueue[T, R]) closeErrorsQueue() {
+	wq.errorsCloserOnce.Do(func() {
+		close(wq.errorsQueue)
+	})
 }
 
 func (wq *SimpleQueue[T, R]) workItemsDrained() <-chan struct{} {

@@ -87,6 +87,17 @@ func TestSQ(t *testing.T) {
 		}
 	})
 
+	t.Run("Collect", func(t *testing.T) {
+		results, err := q.Collect(t.Context(), []int{1, 2, 3, 4, 5}, echoProcessor)
+		require.NoError(t, err)
+		require.Len(t, results, 5)
+		slices.Sort(results)
+
+		for i, r := range results {
+			require.Equal(t, i+1, r)
+		}
+	})
+
 	t.Run("Errors", func(t *testing.T) {
 		queue := q.NewSimpleQueue(2, 1, 5, errProcessor)
 		queue.Start(t.Context())

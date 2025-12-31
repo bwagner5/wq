@@ -123,10 +123,6 @@ func Benchmark(b *testing.B) {
 			})
 
 			require.NoError(b, queue.Drain(time.Second*5))
-			status := queue.Status()
-			b.ReportMetric(float64(status.MinLatency.Nanoseconds()), "MinLatency(ns)")
-			b.ReportMetric(float64(status.MaxLatency.Nanoseconds()), "MaxLatency(ns)")
-			b.ReportMetric(float64(status.AvgLatency.Nanoseconds()), "AvgLatency(ns)")
 		})
 	}
 }

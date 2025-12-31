@@ -29,7 +29,7 @@ type Queue[T, R any] struct {
 	totalConsumedResults       atomic.Int64
 	totalConsumedErrors        atomic.Int64
 	totalItemsProcessed        int
-	durationNanoSum            int
+	durationNanoSum            time.Duration
 	maxLatency                 time.Duration
 	minLatency                 time.Duration
 }
@@ -216,9 +216,9 @@ func (q *Queue[T, R]) executer(processorFunc ProcessorFunc[T, R]) ProcessorFunc[
 		if workItem.Metadata.latency < q.minLatency || q.minLatency == 0 {
 			q.minLatency = workItem.Metadata.latency
 		}
-		// we need to do this while locked so that when we compute avg latency, duration sum and total items are in-sync
-		// since we're locking anyways, we're using regular ints rather than atomics.
-		q.durationNanoSum += int(workItem.Metadata.latency)
+		// we need to do this while locked so that when we compute avg latency, duration sum and total items are in-sync.
+		// since we're locking anyways, we're using regular ints rather than atomic.
+		q.durationNanoSum += workItem.Metadata.latency
 		q.totalItemsProcessed++
 		q.mu.Unlock()
 
@@ -385,7 +385,7 @@ func (q *Queue[T, R]) Status() Status {
 
 	avgLatency := 0
 	if q.totalItemsProcessed > 0 {
-		avgLatency = q.durationNanoSum / q.totalItemsProcessed
+		avgLatency = int(q.durationNanoSum.Nanoseconds()) / q.totalItemsProcessed
 	}
 
 	return Status{
